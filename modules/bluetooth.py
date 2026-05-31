@@ -189,7 +189,7 @@ class BluetoothManager:
         devices = self.scan_devices(timeout=5)
         for device in devices:
             name = device.get("name", "").upper()
-            if "HC-05" in name or "HC05" in name or self.target_name.upper() in name:
+            if any(kw in name for kw in ("HC-05", "HC05", "JDY-31", "JDY31", self.target_name.upper())):
                 if self.connect(device["address"]):
                     return True
 

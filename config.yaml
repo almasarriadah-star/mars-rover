@@ -7,13 +7,13 @@ server:
   cors_enabled: true
 
 bluetooth:
-  device_name: "HC-05"
-  device_address: ""
+  device_name: "JDY-31-SPP"
+  device_address: "78:87:13:04:09:75"
   rfcomm_port: 0
   serial_port: "/dev/rfcomm0"
   baudrate: 9600
-  auto_connect_on_start: false
-  auto_reconnect: false
+  auto_connect_on_start: true
+  auto_reconnect: true
   reconnect_attempts: 5
   reconnect_delay: 3
   scan_timeout: 10
