@@ -1,6 +1,7 @@
 """
 serial_comm.py — وحدة الاتصال السيريال عبر PySerial
 تغلف PySerial مع قفل خيوط لمنع التعارض
+مُحسَّن للتعامل مع JDY-31-SPP (بيانات مكسورة + أول بايتات قمامة)
 """
 
 import serial
@@ -19,6 +20,7 @@ class SerialCommunicator:
         self.baudrate = baudrate
         self.connection = None
         self.lock = threading.Lock()
+        self._line_buffer = b""  # buffer for partial lines
 
     def open(self) -> bool:
         """يفتح الاتصال السيريال"""
@@ -31,8 +33,10 @@ class SerialCommunicator:
             )
             # انتظار قصير لاستقرار الاتصال
             if self.connection.isOpen():
+                # امسح أي بيانات قديمة بالـ buffer (أول اتصال غالباً قمامة)
                 self.connection.reset_input_buffer()
                 self.connection.reset_output_buffer()
+                self._line_buffer = b""
             logger.info(f"Serial opened: {self.port} @ {self.baudrate}")
             return True
         except serial.SerialException as e:
@@ -44,6 +48,7 @@ class SerialCommunicator:
         try:
             if self.connection and self.connection.is_open:
                 self.connection.close()
+            self._line_buffer = b""
             logger.info(f"Serial closed: {self.port}")
             return True
         except Exception as e:
@@ -73,28 +78,54 @@ class SerialCommunicator:
         return False
 
     def read_line(self, timeout: float = 1.0) -> str:
-        """يقرأ سطر واحد من السيريال (حتى \\n)"""
+        """يقرأ سطر واحد — يتراكم في buffer حتى يلقى \\n"""
         with self.lock:
             try:
-                if self.connection and self.connection.is_open:
-                    old_timeout = self.connection.timeout
-                    self.connection.timeout = timeout
-                    line = self.connection.readline()
-                    self.connection.timeout = old_timeout
+                if not (self.connection and self.connection.is_open):
+                    return ""
+
+                old_timeout = self.connection.timeout
+                self.connection.timeout = timeout
+
+                # اقرأ كل المتاح دفعة وحدة
+                waiting = self.connection.in_waiting
+                if waiting > 0:
+                    chunk = self.connection.read(waiting)
+                    self._line_buffer += chunk
+
+                # دور على أول سطر كامل (ينتهي بـ \n أو \r\n)
+                while b"\n" not in self._line_buffer:
+                    byte = self.connection.read(1)
+                    if not byte:
+                        break  # timeout
+                    self._line_buffer += byte
+
+                self.connection.timeout = old_timeout
+
+                # افصل أول سطر كامل
+                if b"\n" in self._line_buffer:
+                    line_bytes, rest = self._line_buffer.split(b"\n", 1)
+                    self._line_buffer = rest
+                    line = line_bytes.decode("utf-8", errors="ignore").strip()
                     if line:
-                        return line.decode("utf-8", errors="ignore").strip()
+                        return line
+
             except Exception as e:
                 logger.debug(f"Serial read error: {e}")
         return ""
 
     def read_json(self, timeout: float = 1.0) -> dict:
-        """يقرأ سطر ويحوله من JSON إلى dict"""
-        line = self.read_line(timeout)
-        if line:
+        """يقرأ سطر ويحوله من JSON إلى dict
+        يتخطى الأسطر المكسورة تلقائياً"""
+        for _ in range(10):  # جرب حتى 10 أسطر مكسورة
+            line = self.read_line(timeout)
+            if not line:
+                return None
             try:
                 return json.loads(line)
             except json.JSONDecodeError:
-                logger.debug(f"Invalid JSON from serial: {line}")
+                logger.debug(f"Skipping malformed line: {line[:80]}")
+                continue
         return None
 
     def is_open(self) -> bool:
@@ -107,5 +138,6 @@ class SerialCommunicator:
             if self.connection and self.connection.is_open:
                 self.connection.reset_input_buffer()
                 self.connection.reset_output_buffer()
+                self._line_buffer = b""
         except Exception:
             pass
