@@ -13,3 +13,4 @@ PyYAML==6.0.3
 eventlet==0.41.0
 python-engineio==4.13.2
 python-socketio==5.16.2
+picamera2>=0.3.22;platform_machine=="aarch64"

@@ -58,8 +58,8 @@
 #define DHT_TYPE  DHT11
 #define RAIN_PIN  A0
 #define MQ2_PIN   A1
-#define ECHO_PIN  A2
-#define TRIG_PIN  A3
+#define ECHO_PIN  A3
+#define TRIG_PIN  A2
 // A4 = btSerial TX  (→ HC-05 RX via voltage divider)
 // A5 = btSerial RX  (← HC-05 TX)
 #define LED_PIN   13

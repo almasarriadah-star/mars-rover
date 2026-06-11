@@ -1,46 +1,48 @@
 """
-MotorController module for Raspberry Pi robot.
+MotorController module for Mars Rover (relay-based).
 
-Controls 4 DC motors (M1-M4: -255 to 255) and 2 Servo motors (S1, S2: 0-180°).
-Sends commands to the Arduino/MCU via BluetoothManager and emits status via SocketIO.
+The Arduino uses 4-channel relays (ON/OFF only) for DC motors, so there is
+NO speed control.  The firmware accepts these JSON commands:
+
+  Movement : {"dir": "F"}  {"dir": "B"}  {"dir": "L"}  {"dir": "R"}  {"dir": "S"}
+  Servos   : {"s1": <0-180>}  {"s2": <0-180>}
+  E-Stop   : {"stop": true}
+
+This module translates high-level SocketIO events into the above protocol
+and sends them to the Arduino via BluetoothManager.send_json().
 """
 
 import logging
-import threading
-import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class MotorController:
-    """Manages DC and servo motors with direction commands, direct JSON control,
-    speed ramping, and emergency stop."""
+    """Controls relay-driven DC motors and two hobby servos on the rover."""
 
-    # ── Motor limits ────────────────────────────────────────────────────
-    DC_MIN = -255
-    DC_MAX = 255
+    # ── Constants ────────────────────────────────────────────────────────
     SERVO_MIN = 0
     SERVO_MAX = 180
     SERVO_CENTER = 90
-    RAMP_STEP = 10  # speed change per ramp tick
-    RAMP_DELAY = 0.05  # seconds between ramp ticks
 
-    # ── Preset direction command table ──────────────────────────────────
-    # Each entry maps a command key to left/right side speed values.
-    # l = left side (m1 + m3), r = right side (m2 + m4)
-    DIRECTION_PRESETS: Dict[str, Dict[str, int]] = {
-        "F":        {"l": 200, "r": 200},
-        "B":        {"l": -200, "r": -200},
-        "L":        {"l": -150, "r": 150},
-        "R":        {"l": 150, "r": -150},
-        "S":        {"l": 0, "r": 0},
-        "FL":       {"l": 100, "r": 200},
-        "FR":       {"l": 200, "r": 100},
-        "BL":       {"l": -100, "r": -200},
-        "BR":       {"l": -200, "r": -100},
-        "SPIN_L":   {"l": -200, "r": 200},
-        "SPIN_R":   {"l": 200, "r": -200},
+    # Valid direction commands the Arduino firmware accepts
+    VALID_DIRECTIONS = {"F", "B", "L", "R", "S"}
+
+    # Human-readable preset names for UI labels / future extensions.
+    # All resolve to one of the 5 valid relay directions.
+    DIRECTION_PRESETS: Dict[str, str] = {
+        "F":      "F",
+        "B":      "B",
+        "L":      "L",
+        "R":      "R",
+        "S":      "S",
+        "FL":     "L",   # front-left  → relay LEFT
+        "FR":     "R",   # front-right → relay RIGHT
+        "BL":    "L",    # back-left   → relay LEFT
+        "BR":    "R",    # back-right  → relay RIGHT
+        "SPIN_L": "L",   # spin left   → relay LEFT
+        "SPIN_R": "R",   # spin right  → relay RIGHT
     }
 
     def __init__(self, bt_manager: Any, socketio: Any = None) -> None:
@@ -49,53 +51,39 @@ class MotorController:
 
         Args:
             bt_manager: A BluetoothManager instance with a ``send_json(data)`` method.
-            socketio:    Optional SocketIO instance for emitting ``motor_status`` events.
+            socketio:   Optional SocketIO instance for emitting ``motor_status`` events.
         """
         self._bt_manager = bt_manager
         self._socketio = socketio
 
-        # Current motor state — 4 DC motors + 2 servos
-        self._m1_speed: int = 0
-        self._m2_speed: int = 0
-        self._m3_speed: int = 0
-        self._m4_speed: int = 0
+        # Current state
+        self._direction: str = "S"  # last direction sent (stopped by default)
         self._s1_angle: int = self.SERVO_CENTER
         self._s2_angle: int = self.SERVO_CENTER
 
-        # Ramping state
-        self._ramp_thread: Optional[threading.Thread] = None
-        self._ramp_stop_event = threading.Event()
-        self._ramp_targets: Dict[str, int] = {}
+        # Compatibility attributes set by app.py config loader (not used by
+        # relay logic, but kept so app.py doesn't break on assignment).
+        self.default_speed: int = 200
+        self.max_speed: int = 255
 
-        self._lock = threading.Lock()
-
-        logger.info("MotorController initialised (bt_manager=%s)", type(bt_manager).__name__)
+        logger.info(
+            "MotorController initialised – relay mode (bt_manager=%s)",
+            type(bt_manager).__name__,
+        )
 
     # ── Public helpers ──────────────────────────────────────────────────
 
     def emergency_stop(self) -> Dict[str, Any]:
-        """Immediately halt all motors and center servos.
+        """Immediately stop all motors and send emergency stop to Arduino.
 
-        Cancels any in-progress ramp, zeroes DC motors, and returns servos
-        to their centre position (90°).
+        Sends both ``{"dir": "S"}`` (direction stop) and ``{"stop": true}``
+        (firmware-level emergency stop) to be absolutely safe.
         """
         logger.warning("EMERGENCY STOP triggered")
-        self._cancel_ramp()
 
-        with self._lock:
-            self._m1_speed = 0
-            self._m2_speed = 0
-            self._m3_speed = 0
-            self._m4_speed = 0
-            self._s1_angle = self.SERVO_CENTER
-            self._s2_angle = self.SERVO_CENTER
-
-        payload = self._build_command(
-            m1=0, m2=0, m3=0, m4=0,
-            s1=self.SERVO_CENTER,
-            s2=self.SERVO_CENTER,
-        )
-        self._send(payload)
+        self._direction = "S"
+        self._send({"dir": "S"})
+        self._send({"stop": True})
         self._emit_status("emergency_stop")
         return {"status": "ok", "action": "emergency_stop"}
 
@@ -104,7 +92,7 @@ class MotorController:
         logger.info("Centering servos")
         return self.set_servo_angle(s1=self.SERVO_CENTER, s2=self.SERVO_CENTER)
 
-    # ── DC motor control ────────────────────────────────────────────────
+    # ── DC motor control (relay-based, no speed) ────────────────────────
 
     def set_motor_speed(
         self,
@@ -112,60 +100,36 @@ class MotorController:
         m2: Optional[int] = None,
         ramp: bool = False,
     ) -> Dict[str, Any]:
-        """Set DC motor speeds directly (m1/m2 side-paired with m3/m4).
+        """Legacy interface kept for app.py compatibility.
+
+        Since relays don't support speed control, this method interprets the
+        intent: non-zero values → forward, zero → stop.
 
         Args:
-            m1:   Speed for motor 1 (-255 … 255). ``None`` leaves unchanged.
-                  m3 mirrors m1 (left side).
-            m2:   Speed for motor 2 (-255 … 255). ``None`` leaves unchanged.
-                  m4 mirrors m2 (right side).
-            ramp: If True, smoothly ramp to the target speed instead of
-                  setting it immediately.
+            m1:   Ignored for speed; if 0 together with m2 → stop.
+            m2:   Ignored for speed; if 0 together with m1 → stop.
+            ramp: Ignored (relays are instant ON/OFF).
         """
-        with self._lock:
-            target_m1 = self._clamp_dc(m1 if m1 is not None else self._m1_speed)
-            target_m2 = self._clamp_dc(m2 if m2 is not None else self._m2_speed)
+        # Determine direction from sign: both zero → stop, else forward
+        val_m1 = m1 if m1 is not None else 0
+        val_m2 = m2 if m2 is not None else 0
 
-        if ramp:
-            logger.info("Ramping motors → m1=%d, m2=%d", target_m1, target_m2)
-            self._start_ramp(target_m1, target_m2)
-            return {"status": "ok", "action": "ramp", "targets": {"m1": target_m1, "m2": target_m2}}
+        if val_m1 == 0 and val_m2 == 0:
+            direction = "S"
+        elif val_m1 < 0 and val_m2 < 0:
+            direction = "B"
+        elif val_m1 < 0 or val_m2 > val_m1:
+            direction = "R"
+        elif val_m2 < 0 or val_m1 > val_m2:
+            direction = "L"
+        else:
+            direction = "F"
 
-        with self._lock:
-            self._m1_speed = target_m1
-            self._m2_speed = target_m2
-            self._m3_speed = target_m1  # mirrors left side
-            self._m4_speed = target_m2  # mirrors right side
-
-        payload = self._build_command(m1=target_m1, m2=target_m2,
-                                      m3=target_m1, m4=target_m2)
-        self._send(payload)
+        self._direction = direction
+        self._send({"dir": direction})
         self._emit_status("set_motor_speed")
-        return {"status": "ok", "action": "set_motor_speed",
-                "m1": target_m1, "m2": target_m2,
-                "m3": target_m1, "m4": target_m2}
-
-    def set_side_speed(self, left: int, right: int) -> Dict[str, Any]:
-        """Set left-side (m1/m3) and right-side (m2/m4) speeds directly.
-
-        Args:
-            left:  Speed for the left side motors (-255 … 255).
-            right: Speed for the right side motors (-255 … 255).
-        """
-        l = self._clamp_dc(left)
-        r = self._clamp_dc(right)
-
-        with self._lock:
-            self._m1_speed = l
-            self._m2_speed = r
-            self._m3_speed = l
-            self._m4_speed = r
-
-        payload = self._build_command(m1=l, m2=r, m3=l, m4=r)
-        self._send(payload)
-        self._emit_status("set_side_speed")
-        return {"status": "ok", "action": "set_side_speed",
-                "m1": l, "m2": r, "m3": l, "m4": r}
+        logger.info("set_motor_speed → direction=%s (relay mode)", direction)
+        return {"status": "ok", "action": "set_motor_speed", "direction": direction}
 
     # ── Servo control ───────────────────────────────────────────────────
 
@@ -176,35 +140,44 @@ class MotorController:
     ) -> Dict[str, Any]:
         """Set servo angles (0–180°).
 
+        Sends individual ``{"s1": angle}`` / ``{"s2": angle}`` commands
+        matching the Arduino serial protocol.
+
         Args:
             s1: Angle for servo 1. ``None`` leaves unchanged.
             s2: Angle for servo 2. ``None`` leaves unchanged.
         """
-        with self._lock:
-            angle_s1 = self._clamp_servo(s1 if s1 is not None else self._s1_angle)
-            angle_s2 = self._clamp_servo(s2 if s2 is not None else self._s2_angle)
-            self._s1_angle = angle_s1
-            self._s2_angle = angle_s2
+        result: Dict[str, Any] = {"status": "ok", "action": "set_servo_angle"}
 
-        payload = self._build_command(s1=angle_s1, s2=angle_s2)
-        self._send(payload)
+        if s1 is not None:
+            angle = self._clamp_servo(int(s1))
+            self._s1_angle = angle
+            self._send({"s1": angle})
+            result["s1"] = angle
+
+        if s2 is not None:
+            angle = self._clamp_servo(int(s2))
+            self._s2_angle = angle
+            self._send({"s2": angle})
+            result["s2"] = angle
+
         self._emit_status("set_servo_angle")
-        logger.info("Servos set → s1=%d°, s2=%d°", angle_s1, angle_s2)
-        return {"status": "ok", "action": "set_servo_angle", "s1": angle_s1, "s2": angle_s2}
+        logger.info("Servos set → s1=%d°, s2=%d°", self._s1_angle, self._s2_angle)
+        return result
 
     # ── High-level move command ─────────────────────────────────────────
 
     def execute_move(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a move command.
+        """Process a move command from the UI.
 
-        Accepts two formats:
+        Accepted formats:
 
         1. **Direction command** – ``{"direction": "F"}`` (or any key in
-           ``DIRECTION_PRESETS``).  An optional ``"speed"`` key (0–100) scales
-           the preset values proportionally.
+           ``DIRECTION_PRESETS``).  The value is mapped to one of the 5
+           relay directions (F/B/L/R/S) and sent as ``{"dir": "X"}``.
 
-        2. **Direct JSON command** – ``{"m1": 150, "m2": -100, "s1": 45}``
-           containing raw motor/servo values. m3/m4 are also supported.
+        2. **Servo command** – ``{"s1": 90}`` and/or ``{"s2": 45}``.
+           Sent as individual ``{"s1": angle}`` / ``{"s2": angle}`` payloads.
 
         Returns a status dict describing what was executed.
         """
@@ -213,225 +186,63 @@ class MotorController:
             return {"status": "error", "message": "data must be a dict"}
 
         direction = data.get("direction")
+        result: Dict[str, Any] = {"status": "ok"}
 
-        # ── Preset direction command ─────────────────────────────────────
+        # ── Direction command ────────────────────────────────────────────
         if direction is not None:
             direction = str(direction).upper()
-            if direction not in self.DIRECTION_PRESETS:
+
+            # Resolve preset aliases (FL, SPIN_L, …) to valid relay direction
+            resolved = self.DIRECTION_PRESETS.get(direction)
+            if resolved is None:
                 logger.warning("Unknown direction command: '%s'", direction)
                 return {"status": "error", "message": f"unknown direction: {direction}"}
 
-            preset = self.DIRECTION_PRESETS[direction]
-            speed_scale = max(0, min(100, int(data.get("speed", 100)))) / 100.0
-
-            # l = left side, r = right side
-            l = int(preset["l"] * speed_scale)
-            r = int(preset["r"] * speed_scale)
-
-            m1 = self._clamp_dc(l)
-            m2 = self._clamp_dc(r)
-            m3 = m1  # rear-left mirrors front-left
-            m4 = m2  # rear-right mirrors front-right
-
-            with self._lock:
-                self._m1_speed = m1
-                self._m2_speed = m2
-                self._m3_speed = m3
-                self._m4_speed = m4
-
-            payload = self._build_command(m1=m1, m2=m2, m3=m3, m4=m4)
-            self._send(payload)
+            self._direction = resolved
+            self._send({"dir": resolved})
             self._emit_status(f"direction:{direction}")
 
-            logger.info(
-                "Direction '%s' executed → m1=%d, m2=%d, m3=%d, m4=%d (scale=%.0f%%)",
-                direction, m1, m2, m3, m4, speed_scale * 100,
-            )
-            return {
-                "status": "ok",
+            logger.info("Direction '%s' → relay '%s'", direction, resolved)
+            result.update({
                 "action": "direction",
-                "direction": direction,
-                "m1": m1, "m2": m2, "m3": m3, "m4": m4,
-            }
+                "direction": resolved,
+                "preset": direction,
+            })
+            return result
 
-        # ── Direct JSON motor/servo command ──────────────────────────────
-        logger.debug("Processing direct JSON command: %s", data)
-
-        m1 = data.get("m1")
-        m2 = data.get("m2")
-        m3 = data.get("m3")
-        m4 = data.get("m4")
+        # ── Servo-only or mixed command ──────────────────────────────────
         s1 = data.get("s1")
         s2 = data.get("s2")
-        ramp = bool(data.get("ramp", False))
 
-        result: Dict[str, Any] = {"status": "ok", "action": "direct"}
-
-        # Handle motors (with optional ramping)
-        if m1 is not None or m2 is not None or m3 is not None or m4 is not None:
-            if ramp:
-                target_m1 = self._clamp_dc(int(m1)) if m1 is not None else self._m1_speed
-                target_m2 = self._clamp_dc(int(m2)) if m2 is not None else self._m2_speed
-                self._start_ramp(target_m1, target_m2)
-                result["ramp"] = {"m1": target_m1, "m2": target_m2}
-            else:
-                with self._lock:
-                    if m1 is not None:
-                        self._m1_speed = self._clamp_dc(int(m1))
-                    if m2 is not None:
-                        self._m2_speed = self._clamp_dc(int(m2))
-                    if m3 is not None:
-                        self._m3_speed = self._clamp_dc(int(m3))
-                    else:
-                        # m3 defaults to mirror m1 if m1 was given and m3 not explicit
-                        if m1 is not None:
-                            self._m3_speed = self._m1_speed
-                    if m4 is not None:
-                        self._m4_speed = self._clamp_dc(int(m4))
-                    else:
-                        # m4 defaults to mirror m2 if m2 was given and m4 not explicit
-                        if m2 is not None:
-                            self._m4_speed = self._m2_speed
-
-                payload = self._build_command(
-                    m1=self._m1_speed, m2=self._m2_speed,
-                    m3=self._m3_speed, m4=self._m4_speed,
-                )
-                self._send(payload)
-                result["m1"] = self._m1_speed
-                result["m2"] = self._m2_speed
-                result["m3"] = self._m3_speed
-                result["m4"] = self._m4_speed
-
-        # Handle servos
         if s1 is not None or s2 is not None:
-            if s1 is not None:
-                self._s1_angle = self._clamp_servo(int(s1))
-            if s2 is not None:
-                self._s2_angle = self._clamp_servo(int(s2))
-            payload = self._build_command(s1=self._s1_angle, s2=self._s2_angle)
-            self._send(payload)
-            result["s1"] = self._s1_angle
-            result["s2"] = self._s2_angle
+            servo_result = self.set_servo_angle(
+                s1=int(s1) if s1 is not None else None,
+                s2=int(s2) if s2 is not None else None,
+            )
+            result.update(servo_result)
 
-        self._emit_status("direct_command")
-        logger.info("Direct command executed → %s", result)
+        # If no recognized keys were found, log a warning
+        if direction is None and s1 is None and s2 is None:
+            logger.warning("execute_move: no actionable keys in data: %s", data)
+            result.update({"action": "noop", "message": "no actionable keys"})
+
         return result
 
     # ── State query ─────────────────────────────────────────────────────
 
     def get_state(self) -> Dict[str, Any]:
-        """Return the current motor and servo state."""
-        with self._lock:
-            return {
-                "m1": self._m1_speed,
-                "m2": self._m2_speed,
-                "m3": self._m3_speed,
-                "m4": self._m4_speed,
-                "s1": self._s1_angle,
-                "s2": self._s2_angle,
-            }
+        """Return the current motor and servo state.
 
-    # ── Speed ramping (background thread) ───────────────────────────────
-
-    def _start_ramp(self, target_m1: int, target_m2: int) -> None:
-        """Start a background thread to ramp motor speeds smoothly."""
-        self._cancel_ramp()
-        self._ramp_stop_event.clear()
-        self._ramp_targets = {"m1": target_m1, "m2": target_m2}
-
-        self._ramp_thread = threading.Thread(
-            target=self._ramp_worker,
-            name="motor-ramp",
-            daemon=True,
-        )
-        self._ramp_thread.start()
-        logger.debug("Ramp thread started → m1=%d, m2=%d", target_m1, target_m2)
-
-    def _cancel_ramp(self) -> None:
-        """Stop any running ramp thread."""
-        if self._ramp_thread is not None and self._ramp_thread.is_alive():
-            self._ramp_stop_event.set()
-            self._ramp_thread.join(timeout=1.0)
-            logger.debug("Previous ramp thread cancelled")
-
-    def _ramp_worker(self) -> None:
-        """Background worker that gradually adjusts motor speeds."""
-        while not self._ramp_stop_event.is_set():
-            with self._lock:
-                cur_m1 = self._m1_speed
-                cur_m2 = self._m2_speed
-
-            tgt_m1 = self._ramp_targets.get("m1", cur_m1)
-            tgt_m2 = self._ramp_targets.get("m2", cur_m2)
-
-            new_m1 = self._ramp_step(cur_m1, tgt_m1)
-            new_m2 = self._ramp_step(cur_m2, tgt_m2)
-
-            with self._lock:
-                self._m1_speed = new_m1
-                self._m2_speed = new_m2
-                self._m3_speed = new_m1  # mirror left
-                self._m4_speed = new_m2  # mirror right
-
-            payload = self._build_command(m1=new_m1, m2=new_m2,
-                                          m3=new_m1, m4=new_m2)
-            self._send(payload)
-            self._emit_status("ramp_tick")
-
-            # Check if we have reached the targets
-            if new_m1 == tgt_m1 and new_m2 == tgt_m2:
-                logger.debug("Ramp complete → m1=%d, m2=%d", new_m1, new_m2)
-                break
-
-            if self._ramp_stop_event.wait(timeout=self.RAMP_DELAY):
-                break  # cancelled
-
-        logger.debug("Ramp worker exiting")
-
-    @staticmethod
-    def _ramp_step(current: int, target: int) -> int:
-        """Compute one ramp step towards *target* from *current*."""
-        diff = target - current
-        if diff == 0:
-            return current
-        step = MotorController.RAMP_STEP if diff > 0 else -MotorController.RAMP_STEP
-        new_val = current + step
-        # Don't overshoot
-        if (step > 0 and new_val > target) or (step < 0 and new_val < target):
-            return target
-        return new_val
+        Returns direction ("F"/"B"/"L"/"R"/"S") instead of individual motor
+        speeds since relays don't support speed control.
+        """
+        return {
+            "direction": self._direction,
+            "s1": self._s1_angle,
+            "s2": self._s2_angle,
+        }
 
     # ── Internal helpers ────────────────────────────────────────────────
-
-    @staticmethod
-    def _build_command(
-        m1: Optional[int] = None,
-        m2: Optional[int] = None,
-        m3: Optional[int] = None,
-        m4: Optional[int] = None,
-        s1: Optional[int] = None,
-        s2: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Construct a JSON command payload, omitting ``None`` values.
-
-        Note: "type" key is intentionally omitted per unified JSON protocol
-        (04_json_protocol.md). The Arduino ignores it anyway.
-        """
-        cmd: Dict[str, Any] = {}
-        if m1 is not None:
-            cmd["m1"] = m1
-        if m2 is not None:
-            cmd["m2"] = m2
-        if m3 is not None:
-            cmd["m3"] = m3
-        if m4 is not None:
-            cmd["m4"] = m4
-        if s1 is not None:
-            cmd["s1"] = s1
-        if s2 is not None:
-            cmd["s2"] = s2
-        return cmd
 
     def _send(self, payload: Dict[str, Any]) -> None:
         """Send a JSON payload via the Bluetooth manager."""
@@ -452,11 +263,6 @@ class MotorController:
             logger.debug("Emitted motor_status (source=%s)", source)
         except Exception:
             logger.exception("Failed to emit motor_status event")
-
-    @classmethod
-    def _clamp_dc(cls, value: int) -> int:
-        """Clamp a DC motor speed to [-255, 255]."""
-        return max(cls.DC_MIN, min(cls.DC_MAX, int(value)))
 
     @classmethod
     def _clamp_servo(cls, value: int) -> int:

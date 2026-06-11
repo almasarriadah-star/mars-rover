@@ -159,6 +159,7 @@ header h1 {
 .sensor-badge .icon { font-size: 1rem; }
 .sensor-badge .label { color: #888; font-size: 0.7rem; }
 .sensor-badge .value { font-weight: 600; color: #4fc3f7; }
+.sensor-badge .unit { color: #666; font-size: 0.65rem; }
 
 /* ===== MOVEMENT CONTROLS ===== */
 .move-grid {
@@ -450,30 +451,35 @@ input[type="range"]::-moz-range-thumb {
   <div class="section">
     <div class="section-title">📡 Sensors</div>
     <div id="sensors-bar">
-      <div class="sensor-badge" id="sensor-temp">
+      <div class="sensor-badge" id="sensor-T">
         <span class="icon">🌡️</span>
         <span class="label">Temp</span>
         <span class="value">--</span>
+        <span class="unit">°C</span>
       </div>
-      <div class="sensor-badge" id="sensor-humidity">
+      <div class="sensor-badge" id="sensor-H">
         <span class="icon">💧</span>
         <span class="label">Hum</span>
         <span class="value">--</span>
+        <span class="unit">%</span>
       </div>
-      <div class="sensor-badge" id="sensor-distance">
+      <div class="sensor-badge" id="sensor-D">
         <span class="icon">📏</span>
         <span class="label">Dist</span>
         <span class="value">--</span>
+        <span class="unit">cm</span>
       </div>
-      <div class="sensor-badge" id="sensor-battery">
-        <span class="icon">🔋</span>
-        <span class="label">Batt</span>
+      <div class="sensor-badge" id="sensor-G">
+        <span class="icon">💨</span>
+        <span class="label">Gas</span>
         <span class="value">--</span>
+        <span class="unit">ppm</span>
       </div>
-      <div class="sensor-badge" id="sensor-light">
-        <span class="icon">☀️</span>
-        <span class="label">Light</span>
+      <div class="sensor-badge" id="sensor-R">
+        <span class="icon">🌧️</span>
+        <span class="label">Rain</span>
         <span class="value">--</span>
+        <span class="unit">%</span>
       </div>
     </div>
   </div>
@@ -612,8 +618,8 @@ input[type="range"]::-moz-range-thumb {
   const cameraPlaceholder = document.getElementById('camera-placeholder');
 
   socket.on('camera_frame', (data) => {
-    if (data && data.image) {
-      cameraFeed.src = 'data:image/jpeg;base64,' + data.image;
+    if (data && data.data) {
+      cameraFeed.src = 'data:image/jpeg;base64,' + data.data;
       if (cameraPlaceholder) cameraPlaceholder.style.display = 'none';
     }
   });
@@ -621,11 +627,13 @@ input[type="range"]::-moz-range-thumb {
   // ===== Sensors =====
   socket.on('sensor_data', (data) => {
     if (!data) return;
-    updateSensorBadge('sensor-temp', data.temperature);
-    updateSensorBadge('sensor-humidity', data.humidity);
-    updateSensorBadge('sensor-distance', data.distance);
-    updateSensorBadge('sensor-battery', data.battery);
-    updateSensorBadge('sensor-light', data.light);
+    // Arduino sends single-letter keys: T, H, D, G, R
+    const sensorKeys = ['T', 'H', 'D', 'G', 'R'];
+    sensorKeys.forEach(key => {
+      if (data[key] !== undefined && data[key] !== null) {
+        updateSensorBadge('sensor-' + key, data[key]);
+      }
+    });
   });
 
   function updateSensorBadge(id, value) {
@@ -633,7 +641,7 @@ input[type="range"]::-moz-range-thumb {
     if (!el) return;
     const valSpan = el.querySelector('.value');
     if (valSpan && value !== undefined && value !== null) {
-      valSpan.textContent = value;
+      valSpan.textContent = typeof value === 'number' ? (Number.isInteger(value) ? value : value.toFixed(1)) : value;
     }
   }
 
@@ -647,13 +655,24 @@ input[type="range"]::-moz-range-thumb {
   // ===== Motor Status =====
   socket.on('motor_status', (data) => {
     if (!data) return;
-    if (data.m1 !== undefined) {
-      document.getElementById('m1-speed').value = data.m1;
-      document.getElementById('m1-speed-val').textContent = data.m1;
+    // New relay-based controller returns direction instead of speeds
+    if (data.direction !== undefined) {
+      // Highlight the active direction button
+      clearActiveButtons();
+      if (data.direction !== 'S' && moveBtns[data.direction]) {
+        moveBtns[data.direction].classList.add('active');
+      }
     }
-    if (data.m2 !== undefined) {
-      document.getElementById('m2-speed').value = data.m2;
-      document.getElementById('m2-speed-val').textContent = data.m2;
+    // Update servo displays if present
+    if (data.s1 !== undefined) {
+      document.getElementById('servo-s1').value = data.s1;
+      document.getElementById('s1-angle').textContent = data.s1 + '°';
+      updateServoDial(document.getElementById('servo-needle-1'), data.s1);
+    }
+    if (data.s2 !== undefined) {
+      document.getElementById('servo-s2').value = data.s2;
+      document.getElementById('s2-angle').textContent = data.s2 + '°';
+      updateServoDial(document.getElementById('servo-needle-2'), data.s2);
     }
   });
 
